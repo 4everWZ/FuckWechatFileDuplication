@@ -15,6 +15,7 @@
   "kill_wechat_before_run": false,
   "dry_run": false,
   "verify_before_link": true,
+  "byte_compare_before_link": true,
   "same_volume_only": true,
   "hash_buffer_mb": 8,
   "prune_missing_on_full_scan": true

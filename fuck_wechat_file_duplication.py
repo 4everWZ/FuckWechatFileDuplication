@@ -52,6 +52,7 @@ DEFAULT_CONFIG = {
     "kill_wechat_before_run": False,
     "dry_run": False,
     "verify_before_link": True,
+    "byte_compare_before_link": True,
     "same_volume_only": True,
     "hash_buffer_mb": 8,
     "prune_missing_on_full_scan": True,
@@ -374,6 +375,27 @@ def hash_file(path: Path, buffer_size: int) -> str:
     return h.hexdigest()
 
 
+def records_still_match(expected: FileRecord, actual: FileRecord) -> bool:
+    if actual.size != expected.size or actual.mtime_ns != expected.mtime_ns:
+        return False
+    if expected.st_dev and actual.st_dev and actual.st_dev != expected.st_dev:
+        return False
+    if expected.st_ino and actual.st_ino and actual.st_ino != expected.st_ino:
+        return False
+    return True
+
+
+def files_have_same_content(left: Path, right: Path, buffer_size: int) -> bool:
+    with left.open("rb", buffering=0) as left_file, right.open("rb", buffering=0) as right_file:
+        while True:
+            left_chunk = left_file.read(buffer_size)
+            right_chunk = right_file.read(buffer_size)
+            if left_chunk != right_chunk:
+                return False
+            if not left_chunk:
+                return True
+
+
 def stat_record(path: Path) -> Optional[FileRecord]:
     try:
         st = path.stat()
@@ -390,11 +412,50 @@ def stat_record(path: Path) -> Optional[FileRecord]:
         return None
 
 
+def verify_candidate_content(
+    current: FileRecord,
+    candidate: Path,
+    buffer_size: int,
+) -> Optional[FileRecord]:
+    current_before = stat_record(current.path)
+    candidate_before = stat_record(candidate)
+    if current_before is None or candidate_before is None:
+        return None
+    if not records_still_match(current, current_before):
+        logging.debug("Current file changed before candidate verification: %s", current.path)
+        return None
+    if candidate_before.size != current.size:
+        return None
+
+    try:
+        same_content = files_have_same_content(current.path, candidate, buffer_size)
+    except OSError as exc:
+        logging.debug("Content compare failed: %s <-> %s | %s", current.path, candidate, exc)
+        return None
+
+    current_after = stat_record(current.path)
+    candidate_after = stat_record(candidate)
+    if current_after is None or candidate_after is None:
+        return None
+    if not records_still_match(current_before, current_after):
+        logging.debug("Current file changed during candidate verification: %s", current.path)
+        return None
+    if not records_still_match(candidate_before, candidate_after):
+        logging.debug("Candidate changed during verification, skipped: %s", candidate)
+        return None
+    if not same_content:
+        logging.debug("Candidate content does not match current file, skipped: %s", candidate)
+        return None
+    return candidate_after
+
+
 def select_canonical(
     current: FileRecord,
     candidates: Sequence[Path],
     cfg: Dict,
-) -> Optional[Path]:
+    buffer_size: int,
+) -> Optional[Tuple[Path, Optional[FileRecord]]]:
+    byte_compare = bool(cfg.get("byte_compare_before_link", True))
     for candidate in candidates:
         if str(candidate) == str(current.path):
             continue
@@ -409,7 +470,11 @@ def select_canonical(
             continue
         if cand_rec.size != current.size:
             continue
-        return candidate
+        if byte_compare:
+            cand_rec = verify_candidate_content(current, candidate, buffer_size)
+            if cand_rec is None:
+                continue
+        return candidate, cand_rec
     return None
 
 
@@ -418,6 +483,7 @@ def hardlink_duplicate(
     canonical: Path,
     cfg: Dict,
     dry_run: bool,
+    canonical_record: Optional[FileRecord] = None,
 ) -> Tuple[bool, Optional[FileRecord]]:
     if cfg.get("verify_before_link", True):
         latest = stat_record(duplicate.path)
@@ -427,6 +493,14 @@ def hardlink_duplicate(
         if latest.size != duplicate.size or latest.mtime_ns != duplicate.mtime_ns:
             logging.debug("Duplicate changed before link, skipped: %s", duplicate.path)
             return False, latest
+        if canonical_record is not None:
+            latest_canonical = stat_record(canonical)
+            if latest_canonical is None:
+                logging.debug("Canonical disappeared before link: %s", canonical)
+                return False, latest
+            if not records_still_match(canonical_record, latest_canonical):
+                logging.debug("Canonical changed before link, skipped: %s", canonical)
+                return False, latest
 
     if dry_run:
         logging.info("[DRY-RUN] duplicate -> hardlink: %s -> %s", duplicate.path, canonical)
@@ -501,12 +575,19 @@ def process_records(records: Sequence[FileRecord], db: DedupeDB, cfg: Dict, stat
                 continue
 
         candidates = db.candidates_for_hash(digest, rec.size)
-        canonical = select_canonical(rec, candidates, cfg)
-        if canonical is None:
+        selected = select_canonical(rec, candidates, cfg, buffer_size)
+        if selected is None:
             db.upsert(rec, digest)
             continue
+        canonical, canonical_record = selected
 
-        ok, linked_record = hardlink_duplicate(rec, canonical, cfg, dry_run=dry_run)
+        ok, linked_record = hardlink_duplicate(
+            rec,
+            canonical,
+            cfg,
+            dry_run=dry_run,
+            canonical_record=canonical_record,
+        )
         if ok:
             stats.hardlinked_files += 1
             stats.saved_bytes += rec.size

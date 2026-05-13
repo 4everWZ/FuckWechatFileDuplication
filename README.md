@@ -100,6 +100,7 @@ Set-ExecutionPolicy -Scope Process Bypass
   "exclude_file_extensions": [],
   "kill_wechat_before_run": false,
   "verify_before_link": true,
+  "byte_compare_before_link": true,
   "same_volume_only": true,
   "hash_buffer_mb": 8
 }
@@ -115,6 +116,8 @@ Set-ExecutionPolicy -Scope Process Bypass
 - `exclude_dir_names`: 要排除的目录名。默认空，符合“见蟑螂就打”的策略。
 - `exclude_file_extensions`: 要排除的扩展名。默认空。
 - `kill_wechat_before_run`: 配置层面的杀微信开关。`run_once.bat` 已经通过 `--kill-wechat` 开启。
+- `verify_before_link`: 硬链接前再次检查待替换文件和候选文件没有变化。
+- `byte_compare_before_link`: 硬链接前逐字节确认两份文件当前内容一致，避免 SQLite 索引陈旧时误链接。
 - `same_volume_only`: 只在同一分区内硬链接。NTFS 硬链接本身也要求同卷。
 
 ## 注意
