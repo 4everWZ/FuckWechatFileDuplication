@@ -1,0 +1,21 @@
+{
+  "roots": [
+    "D:\\xwechat_files"
+  ],
+  "db_path": "wechat_dedupe_index.sqlite3",
+  "log_dir": "logs",
+  "min_size_bytes": 65536,
+  "skip_recent_hours": 72,
+  "recent_months": 3,
+  "monthly_full_scan_day": 1,
+  "process_non_month_dirs": true,
+  "aggressive_all_files": true,
+  "exclude_dir_names": [],
+  "exclude_file_extensions": [],
+  "kill_wechat_before_run": false,
+  "dry_run": false,
+  "verify_before_link": true,
+  "same_volume_only": true,
+  "hash_buffer_mb": 8,
+  "prune_missing_on_full_scan": true
+}
