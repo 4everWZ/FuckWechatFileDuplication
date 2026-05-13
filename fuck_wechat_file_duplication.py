@@ -17,6 +17,7 @@ import os
 import queue
 import re
 import sqlite3
+import stat as stat_module
 import subprocess
 import sys
 import threading
@@ -41,6 +42,7 @@ APP_NAME = "Fuck_Wechat_File_Duplication"
 MONTH_RE = re.compile(r"^\d{4}-\d{2}$")
 BACKUP_SUFFIX_RE = re.compile(r"^(?P<original>.+)\.dedupe_backup\.(?P<pid>\d+)\.(?P<timestamp>\d+)$")
 LEGACY_BACKUP_SUFFIX_RE = re.compile(r"^\.(?P<original>.+)\.dedupe_backup\.(?P<pid>\d+)\.(?P<timestamp>\d+)$")
+TEMP_LINK_SUFFIX_RE = re.compile(r"^(?P<original>.+)\.dedupe_link\.(?P<pid>\d+)\.(?P<timestamp>\d+)$")
 DEFAULT_CONFIG = {
     "roots": [r"D:\\xwechat_files"],
     "source_roots": [r"~\\Downloads", r"~\\Desktop", r"D:\\Paper"],
@@ -312,6 +314,17 @@ def make_backup_path(path: Path) -> Path:
     return path.with_name(f"{path.name}.dedupe_backup.{os.getpid()}.{time.time_ns()}")
 
 
+def make_temp_link_path(path: Path) -> Path:
+    timestamp_ms = int(time.time() * 1000)
+    for offset in range(1000):
+        candidate = path.with_name(
+            f"{path.name}.dedupe_link.{os.getpid()}.{timestamp_ms + offset}"
+        )
+        if not candidate.exists():
+            return candidate
+    return path.with_name(f"{path.name}.dedupe_link.{os.getpid()}.{time.time_ns()}")
+
+
 def original_path_for_backup(path: Path) -> Optional[Path]:
     legacy_match = LEGACY_BACKUP_SUFFIX_RE.match(path.name)
     if legacy_match is not None:
@@ -324,6 +337,41 @@ def original_path_for_backup(path: Path) -> Optional[Path]:
 
 def is_dedupe_backup_path(path: Path) -> bool:
     return original_path_for_backup(path) is not None
+
+
+def is_dedupe_temp_link_path(path: Path) -> bool:
+    return TEMP_LINK_SUFFIX_RE.match(path.name) is not None
+
+
+def is_dedupe_internal_path(path: Path) -> bool:
+    return is_dedupe_backup_path(path) or is_dedupe_temp_link_path(path)
+
+
+def make_path_writable(path: Path) -> None:
+    try:
+        current_mode = path.stat().st_mode
+        os.chmod(path, current_mode | stat_module.S_IWRITE)
+    except OSError:
+        # Let the following rename/unlink report the concrete operation failure.
+        return
+
+
+def delete_path_with_retries(path: Path, attempts: int = 3, delay_seconds: float = 0.2) -> bool:
+    for attempt in range(max(1, attempts)):
+        if not path.exists():
+            return True
+        make_path_writable(path)
+        try:
+            path.unlink()
+            return True
+        except FileNotFoundError:
+            return True
+        except OSError as exc:
+            if attempt == max(1, attempts) - 1:
+                logging.debug("Delete failed after retries: %s | %s", path, exc)
+                return False
+            time.sleep(max(delay_seconds, 0.0))
+    return not path.exists()
 
 
 def normalize_extensions(exts: Iterable[str]) -> set[str]:
@@ -389,7 +437,7 @@ def iter_files(
                 stats.scanned_files += 1
                 p = current / filename
                 try:
-                    if is_dedupe_backup_path(p):
+                    if is_dedupe_internal_path(p):
                         continue
                     if exclude_exts and p.suffix.lower() in exclude_exts:
                         continue
@@ -505,7 +553,7 @@ def iter_source_candidates_by_size(
             for filename in filenames:
                 candidate = current / filename
                 try:
-                    if is_dedupe_backup_path(candidate):
+                    if is_dedupe_internal_path(candidate):
                         continue
                     if exclude_exts and candidate.suffix.lower() in exclude_exts:
                         continue
@@ -623,7 +671,7 @@ def handle_watch_path(
     stats: Stats,
     dry_run: bool,
 ) -> bool:
-    if is_dedupe_backup_path(path) or path.is_symlink():
+    if is_dedupe_internal_path(path) or path.is_symlink():
         return False
 
     stable = wait_for_stable_file(
@@ -670,7 +718,7 @@ def run_watch(roots: Sequence[Path], source_roots: Sequence[Path], cfg: Dict, dr
 
     def enqueue(path_str: str) -> None:
         path = Path(path_str)
-        if is_dedupe_backup_path(path):
+        if is_dedupe_internal_path(path):
             return
         work_queue.put(path)
 
@@ -744,6 +792,20 @@ def recover_interrupted_backups(roots: Sequence[Path], buffer_size: int) -> Back
         for dirpath, _, filenames in os.walk(root, followlinks=False):
             for filename in filenames:
                 backup = Path(dirpath) / filename
+                if is_dedupe_temp_link_path(backup):
+                    try:
+                        if backup.is_symlink() or not backup.is_file():
+                            continue
+                        if delete_path_with_retries(backup):
+                            stats.removed_backups += 1
+                            logging.info("Removed interrupted temp hardlink: %s", backup)
+                        else:
+                            stats.errors += 1
+                            logging.warning("Temp hardlink cleanup failed, left in place: %s", backup)
+                    except OSError as exc:
+                        stats.errors += 1
+                        logging.warning("Temp hardlink cleanup failed, left in place: %s | %s", backup, exc)
+                    continue
                 original = original_path_for_backup(backup)
                 if original is None:
                     continue
@@ -751,14 +813,18 @@ def recover_interrupted_backups(roots: Sequence[Path], buffer_size: int) -> Back
                     if backup.is_symlink() or not backup.is_file():
                         continue
                     if not original.exists():
+                        make_path_writable(backup)
                         backup.rename(original)
                         stats.restored_backups += 1
                         logging.info("Recovered interrupted backup: %s -> %s", backup, original)
                         continue
                     if is_same_physical_file(backup, original):
-                        backup.unlink()
-                        stats.removed_backups += 1
-                        logging.info("Removed redundant backup hardlink: %s", backup)
+                        if delete_path_with_retries(backup):
+                            stats.removed_backups += 1
+                            logging.info("Removed redundant backup hardlink: %s", backup)
+                        else:
+                            stats.errors += 1
+                            logging.warning("Redundant backup cleanup failed, left in place: %s", backup)
                         continue
 
                     backup_rec = stat_record(backup)
@@ -772,9 +838,12 @@ def recover_interrupted_backups(roots: Sequence[Path], buffer_size: int) -> Back
                         original,
                         buffer_size,
                     ):
-                        backup.unlink()
-                        stats.removed_backups += 1
-                        logging.info("Removed redundant backup with identical content: %s", backup)
+                        if delete_path_with_retries(backup):
+                            stats.removed_backups += 1
+                            logging.info("Removed redundant backup with identical content: %s", backup)
+                        else:
+                            stats.errors += 1
+                            logging.warning("Identical backup cleanup failed, left in place: %s", backup)
                         continue
 
                     stats.conflicted_backups += 1
@@ -899,26 +968,38 @@ def hardlink_duplicate(
         logging.info("[DRY-RUN] duplicate -> hardlink: %s -> %s", duplicate.path, canonical)
         return True, duplicate
 
-    tmp_backup = make_backup_path(duplicate.path)
+    tmp_link = make_temp_link_path(duplicate.path)
+    original_mode: Optional[int] = None
 
     try:
-        duplicate.path.rename(tmp_backup)
+        os.link(str(canonical), str(tmp_link))
         try:
-            os.link(str(canonical), str(duplicate.path))
+            original_mode = duplicate.path.stat().st_mode
         except OSError:
-            # Restore original path if hardlink creation fails.
-            tmp_backup.rename(duplicate.path)
-            raise
-
+            original_mode = None
+        make_path_writable(duplicate.path)
         try:
-            tmp_backup.unlink()
-        except OSError as exc:
-            logging.warning("Hardlink created but backup cleanup failed: %s | %s", tmp_backup, exc)
+            os.replace(str(tmp_link), str(duplicate.path))
+        except OSError:
+            if (
+                original_mode is not None
+                and duplicate.path.exists()
+                and not is_same_physical_file(duplicate.path, canonical)
+            ):
+                try:
+                    os.chmod(duplicate.path, original_mode)
+                except OSError:
+                    pass
+            if not delete_path_with_retries(tmp_link):
+                logging.warning("Hardlink temp cleanup failed, left in place: %s", tmp_link)
+            raise
 
         linked = stat_record(duplicate.path)
         logging.info("hardlinked: %s -> %s", duplicate.path, canonical)
         return True, linked
     except OSError as exc:
+        if tmp_link.exists() and not delete_path_with_retries(tmp_link):
+            logging.warning("Hardlink temp cleanup failed, left in place: %s", tmp_link)
         logging.warning("Hardlink failed: %s -> %s | %s", duplicate.path, canonical, exc)
         return False, stat_record(duplicate.path)
 

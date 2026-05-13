@@ -1,6 +1,9 @@
 import tempfile
 import unittest
+import os
+import stat
 from pathlib import Path
+from unittest.mock import patch
 
 import fuck_wechat_file_duplication as dedupe
 
@@ -167,6 +170,29 @@ class DedupeSafetyTests(unittest.TestCase):
             self.assertEqual(stats.removed_backups, 1)
             self.assertEqual(stats.conflicted_backups, 0)
 
+    def test_recover_interrupted_backup_removes_readonly_identical_backup(self) -> None:
+        content = b"A" * 70000
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            original = root / "report.pdf"
+            backup = root / "report.pdf.dedupe_backup.123.456"
+            original.write_bytes(content)
+            backup.write_bytes(content)
+            os.chmod(backup, stat.S_IREAD)
+
+            try:
+                stats = dedupe.recover_interrupted_backups([root], buffer_size=1024 * 1024)
+            finally:
+                if backup.exists():
+                    os.chmod(backup, stat.S_IWRITE | stat.S_IREAD)
+
+            self.assertEqual(original.read_bytes(), content)
+            self.assertFalse(backup.exists())
+            self.assertEqual(stats.restored_backups, 0)
+            self.assertEqual(stats.removed_backups, 1)
+            self.assertEqual(stats.conflicted_backups, 0)
+
     def test_recover_interrupted_backup_keeps_conflicting_backup(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -185,13 +211,15 @@ class DedupeSafetyTests(unittest.TestCase):
             self.assertEqual(stats.conflicted_backups, 1)
             self.assertIn("Backup recovery conflict", logs.output[0])
 
-    def test_iter_files_skips_dedupe_backup_files(self) -> None:
+    def test_iter_files_skips_dedupe_internal_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             normal = root / "normal.bin"
             backup = root / "normal.bin.dedupe_backup.123.456"
+            temp_link = root / "normal.bin.dedupe_link.123.456"
             normal.write_bytes(b"A" * 70000)
             backup.write_bytes(b"A" * 70000)
+            temp_link.write_bytes(b"A" * 70000)
 
             cfg = dict(dedupe.DEFAULT_CONFIG)
             cfg["min_size_bytes"] = 1
@@ -201,6 +229,72 @@ class DedupeSafetyTests(unittest.TestCase):
             records = list(dedupe.iter_files([root], cfg, full_scan=True, stats=stats))
 
             self.assertEqual([record.path for record in records], [normal])
+
+    def test_recover_interrupted_backups_removes_temp_links(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            temp_link = root / "report.pdf.dedupe_link.123.456"
+            temp_link.write_bytes(b"A" * 70000)
+
+            stats = dedupe.recover_interrupted_backups([root], buffer_size=1024 * 1024)
+
+            self.assertFalse(temp_link.exists())
+            self.assertEqual(stats.removed_backups, 1)
+            self.assertEqual(stats.errors, 0)
+
+    def test_delete_path_with_retries_handles_transient_permission_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "temp-link.bin"
+            target.write_bytes(b"A" * 70000)
+            real_unlink = Path.unlink
+            calls = []
+
+            def flaky_unlink(path: Path, *args, **kwargs) -> None:
+                if path == target and not calls:
+                    calls.append(path)
+                    raise PermissionError("temporary access denied")
+                real_unlink(path, *args, **kwargs)
+
+            with patch.object(Path, "unlink", flaky_unlink):
+                removed = dedupe.delete_path_with_retries(target, attempts=2, delay_seconds=0)
+
+            self.assertTrue(removed)
+            self.assertFalse(target.exists())
+            self.assertEqual(len(calls), 1)
+
+    def test_hardlink_duplicate_keeps_original_and_cleans_temp_link_when_replace_fails(self) -> None:
+        content = b"A" * 70000
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            canonical = root / "canonical.bin"
+            duplicate = root / "duplicate.bin"
+            canonical.write_bytes(content)
+            duplicate.write_bytes(content)
+            duplicate_record = dedupe.stat_record(duplicate)
+            canonical_record = dedupe.stat_record(canonical)
+            self.assertIsNotNone(duplicate_record)
+            self.assertIsNotNone(canonical_record)
+
+            with patch("fuck_wechat_file_duplication.os.replace", side_effect=PermissionError("replace blocked")):
+                ok, latest = dedupe.hardlink_duplicate(
+                    duplicate_record,  # type: ignore[arg-type]
+                    canonical,
+                    dict(dedupe.DEFAULT_CONFIG),
+                    dry_run=False,
+                    canonical_record=canonical_record,  # type: ignore[arg-type]
+                )
+
+            self.assertFalse(ok)
+            self.assertIsNotNone(latest)
+            self.assertEqual(duplicate.read_bytes(), content)
+            self.assertFalse(dedupe.is_same_physical_file(duplicate, canonical))
+            leftovers = [
+                path.name
+                for path in root.iterdir()
+                if ".dedupe_backup." in path.name or ".dedupe_link." in path.name
+            ]
+            self.assertEqual(leftovers, [])
 
     def test_matching_duplicate_is_hardlinked(self) -> None:
         content = b"A" * 70000
