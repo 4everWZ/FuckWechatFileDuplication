@@ -19,8 +19,11 @@ Fuck_Wechat_File_Duplication/
   run_dry_run.bat
   run_full_once.bat
   run_once.bat
+  run_watch.bat
   install_task.ps1
+  install_watch_task.ps1
   uninstall_task.ps1
+  uninstall_watch_task.ps1
 ```
 
 ## 1. 修改配置
@@ -78,19 +81,46 @@ Set-ExecutionPolicy -Scope Process Bypass
 .\install_task.ps1
 ```
 
-默认每天 03:30 运行 `run_once.bat`。日常模式只扫描最近 `recent_months` 个月；每月 `monthly_full_scan_day` 做一次全量扫描。
+默认每周日 03:30 运行 `run_once.bat`。日常模式只扫描最近 `recent_months` 个月；如果运行当天刚好是 `monthly_full_scan_day`，则做一次全量扫描。
 
-## 6. 卸载定时任务
+## 6. 安装实时监听任务
+
+`run_watch.bat` 会长期监听微信文件目录。微信新建或修改文件后，脚本会等文件稳定，再到 `source_roots` 里按相同大小懒查候选；只有 hash 和逐字节内容都一致时，才把微信副本替换为指向原始文件的硬链接。
+
+实时监听模式不会启动时全树扫描 backup；中断备份恢复仍由每周兜底任务处理。
+
+PowerShell 中运行：
+
+```powershell
+Set-ExecutionPolicy -Scope Process Bypass
+.\install_watch_task.ps1
+```
+
+这个任务在当前用户登录时启动，不会杀微信。要马上手动启动，可以运行：
+
+```powershell
+.\run_watch.bat
+```
+
+如果系统策略不允许创建登录计划任务，安装脚本会自动退回到当前用户 Startup 快捷方式，效果仍然是登录后启动监听。
+
+## 7. 卸载定时任务
 
 ```powershell
 Set-ExecutionPolicy -Scope Process Bypass
 .\uninstall_task.ps1
+.\uninstall_watch_task.ps1
 ```
 
 ## 配置说明
 
 ```json
 {
+  "source_roots": [
+    "~\\Downloads",
+    "~\\Desktop",
+    "D:\\Paper"
+  ],
   "min_size_bytes": 65536,
   "skip_recent_hours": 72,
   "recent_months": 3,
@@ -102,12 +132,16 @@ Set-ExecutionPolicy -Scope Process Bypass
   "verify_before_link": true,
   "byte_compare_before_link": true,
   "same_volume_only": true,
-  "hash_buffer_mb": 8
+  "hash_buffer_mb": 8,
+  "watch_stable_seconds": 8,
+  "watch_poll_seconds": 1,
+  "watch_timeout_seconds": 120
 }
 ```
 
 关键项：
 
+- `source_roots`: 实时监听模式用来查找“原始文件”的目录。默认 `Downloads`、`Desktop`、`D:\Paper`。
 - `min_size_bytes`: 小于该大小的文件跳过。默认 64KB，避免浪费时间处理碎片文件。
 - `skip_recent_hours`: 跳过最近 N 小时内修改过的文件，避免处理微信仍在写入的文件。
 - `recent_months`: 日常增量扫描最近 N 个月的 `YYYY-MM` 文件夹。
@@ -119,6 +153,9 @@ Set-ExecutionPolicy -Scope Process Bypass
 - `verify_before_link`: 硬链接前再次检查待替换文件和候选文件没有变化。
 - `byte_compare_before_link`: 硬链接前逐字节确认两份文件当前内容一致，避免 SQLite 索引陈旧时误链接。
 - `same_volume_only`: 只在同一分区内硬链接。NTFS 硬链接本身也要求同卷。
+- `watch_stable_seconds`: 实时监听模式里，文件连续稳定多少秒后才处理。
+- `watch_poll_seconds`: 等待文件稳定时的检查间隔。
+- `watch_timeout_seconds`: 单个监听事件等待文件稳定的最长时间。
 
 ## 注意
 
@@ -126,6 +163,10 @@ Set-ExecutionPolicy -Scope Process Bypass
 
 脚本只在发现内容完全相同后替换重复文件。它不是“按文件名删除”，也不是“按时间删除”。
 
+替换重复文件时会先把原路径重命名为 `<原文件名>.dedupe_backup.<pid>.<timestamp>`，硬链接创建成功后才删除这个临时备份。如果脚本中途崩溃，下次启动会自动恢复：原路径不存在就还原；原路径存在且内容一致就清理备份；内容冲突则保留备份并写 warning。恢复逻辑也兼容旧版 `.原文件名.dedupe_backup.<pid>.<timestamp>` 临时备份。
+
 默认跳过最近 72 小时的新文件，主要是为了避开微信正在写文件、刚接收文件、半落盘文件。
+
+实时监听不是驱动层拦截。微信仍然会先创建副本；脚本会在文件稳定后尽快把副本替换为硬链接。原始文件和微信副本必须在同一个 NTFS 分区，才能硬链接。
 
 不要把微信安装目录和聊天数据目录混在同一个自动任务里。如果要处理安装目录，建议另建单独配置，微信更新后手动跑 dry-run 再决定。

@@ -14,10 +14,12 @@ import argparse
 import json
 import logging
 import os
+import queue
 import re
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -37,8 +39,11 @@ except ImportError as exc:  # pragma: no cover - clear runtime failure for users
 
 APP_NAME = "Fuck_Wechat_File_Duplication"
 MONTH_RE = re.compile(r"^\d{4}-\d{2}$")
+BACKUP_SUFFIX_RE = re.compile(r"^(?P<original>.+)\.dedupe_backup\.(?P<pid>\d+)\.(?P<timestamp>\d+)$")
+LEGACY_BACKUP_SUFFIX_RE = re.compile(r"^\.(?P<original>.+)\.dedupe_backup\.(?P<pid>\d+)\.(?P<timestamp>\d+)$")
 DEFAULT_CONFIG = {
     "roots": [r"D:\\xwechat_files"],
+    "source_roots": [r"~\\Downloads", r"~\\Desktop", r"D:\\Paper"],
     "db_path": "wechat_dedupe_index.sqlite3",
     "log_dir": "logs",
     "min_size_bytes": 65536,
@@ -55,6 +60,9 @@ DEFAULT_CONFIG = {
     "byte_compare_before_link": True,
     "same_volume_only": True,
     "hash_buffer_mb": 8,
+    "watch_stable_seconds": 8,
+    "watch_poll_seconds": 1,
+    "watch_timeout_seconds": 120,
     "prune_missing_on_full_scan": True,
 }
 
@@ -88,7 +96,18 @@ class Stats:
     skipped_small: int = 0
     skipped_locked: int = 0
     skipped_errors: int = 0
+    source_candidates_scanned: int = 0
+    source_candidates_hashed: int = 0
+    source_hardlinked_files: int = 0
     saved_bytes: int = 0
+
+
+@dataclass
+class BackupRecoveryStats:
+    restored_backups: int = 0
+    removed_backups: int = 0
+    conflicted_backups: int = 0
+    errors: int = 0
 
 
 class DedupeDB:
@@ -200,6 +219,16 @@ def load_config(path: Path) -> Dict:
     return cfg
 
 
+def resolve_config_paths(paths: Iterable[str]) -> List[Path]:
+    resolved = []
+    for raw in paths:
+        value = str(raw).strip()
+        if not value:
+            continue
+        resolved.append(Path(value).expanduser())
+    return resolved
+
+
 def setup_logging(log_dir: Path) -> None:
     log_dir.mkdir(parents=True, exist_ok=True)
     log_file = log_dir / f"wechat_dedupe_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
@@ -272,6 +301,31 @@ def is_same_physical_file(a: Path, b: Path) -> bool:
         return False
 
 
+def make_backup_path(path: Path) -> Path:
+    timestamp_ms = int(time.time() * 1000)
+    for offset in range(1000):
+        candidate = path.with_name(
+            f"{path.name}.dedupe_backup.{os.getpid()}.{timestamp_ms + offset}"
+        )
+        if not candidate.exists():
+            return candidate
+    return path.with_name(f"{path.name}.dedupe_backup.{os.getpid()}.{time.time_ns()}")
+
+
+def original_path_for_backup(path: Path) -> Optional[Path]:
+    legacy_match = LEGACY_BACKUP_SUFFIX_RE.match(path.name)
+    if legacy_match is not None:
+        return path.with_name(legacy_match.group("original"))
+    match = BACKUP_SUFFIX_RE.match(path.name)
+    if match is None:
+        return None
+    return path.with_name(match.group("original"))
+
+
+def is_dedupe_backup_path(path: Path) -> bool:
+    return original_path_for_backup(path) is not None
+
+
 def normalize_extensions(exts: Iterable[str]) -> set[str]:
     out = set()
     for e in exts:
@@ -335,6 +389,8 @@ def iter_files(
                 stats.scanned_files += 1
                 p = current / filename
                 try:
+                    if is_dedupe_backup_path(p):
+                        continue
                     if exclude_exts and p.suffix.lower() in exclude_exts:
                         continue
                     if p.is_symlink():
@@ -394,6 +450,343 @@ def files_have_same_content(left: Path, right: Path, buffer_size: int) -> bool:
                 return False
             if not left_chunk:
                 return True
+
+
+def wait_for_stable_file(
+    path: Path,
+    stable_seconds: float,
+    poll_seconds: float,
+    timeout_seconds: float,
+) -> Optional[FileRecord]:
+    deadline = time.time() + max(timeout_seconds, poll_seconds)
+    stable_since: Optional[float] = None
+    last_signature: Optional[Tuple[int, int]] = None
+    poll = max(poll_seconds, 0.01)
+    required_stable = max(stable_seconds, 0.0)
+
+    while time.time() <= deadline:
+        record = stat_record(path)
+        if record is None or path.is_symlink():
+            stable_since = None
+            last_signature = None
+            time.sleep(poll)
+            continue
+
+        signature = (record.size, record.mtime_ns)
+        now = time.time()
+        if signature != last_signature:
+            last_signature = signature
+            stable_since = now
+        elif stable_since is not None and now - stable_since >= required_stable:
+            return record
+        time.sleep(poll)
+    return None
+
+
+def iter_source_candidates_by_size(
+    source_roots: Sequence[Path],
+    target: FileRecord,
+    cfg: Dict,
+    stats: Optional[Stats] = None,
+) -> Iterator[FileRecord]:
+    exclude_dirs = {str(x).lower() for x in cfg.get("exclude_dir_names", [])}
+    exclude_exts = normalize_extensions(cfg.get("exclude_file_extensions", []))
+
+    for root in source_roots:
+        if not root.exists():
+            logging.debug("Source root does not exist, skipped: %s", root)
+            continue
+        if cfg.get("same_volume_only", True) and not is_same_volume(target.path, root):
+            logging.debug("Source root is on a different volume, skipped: %s", root)
+            continue
+        for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+            dirnames[:] = [dirname for dirname in dirnames if dirname.lower() not in exclude_dirs]
+            current = Path(dirpath)
+            for filename in filenames:
+                candidate = current / filename
+                try:
+                    if is_dedupe_backup_path(candidate):
+                        continue
+                    if exclude_exts and candidate.suffix.lower() in exclude_exts:
+                        continue
+                    if candidate.is_symlink():
+                        continue
+                    if str(candidate) == str(target.path):
+                        continue
+                    if cfg.get("same_volume_only", True) and not is_same_volume(target.path, candidate):
+                        continue
+                    if is_same_physical_file(target.path, candidate):
+                        continue
+                    record = stat_record(candidate)
+                    if record is None:
+                        continue
+                    if stats is not None:
+                        stats.source_candidates_scanned += 1
+                    if record.size != target.size:
+                        continue
+                    yield record
+                except OSError as exc:
+                    if stats is not None:
+                        stats.skipped_errors += 1
+                    logging.debug("Source candidate stat failed: %s | %s", candidate, exc)
+
+
+def find_matching_source_file(
+    target: FileRecord,
+    source_roots: Sequence[Path],
+    cfg: Dict,
+    buffer_size: int,
+    stats: Optional[Stats] = None,
+) -> Optional[Tuple[Path, FileRecord]]:
+    target_before = stat_record(target.path)
+    if target_before is None or not records_still_match(target, target_before):
+        return None
+
+    try:
+        target_digest = hash_file(target.path, buffer_size)
+    except OSError as exc:
+        logging.debug("Target hash failed before source lookup: %s | %s", target.path, exc)
+        return None
+
+    target_after = stat_record(target.path)
+    if target_after is None or not records_still_match(target_before, target_after):
+        logging.debug("Target changed during source lookup hash, skipped: %s", target.path)
+        return None
+
+    for candidate in iter_source_candidates_by_size(source_roots, target_after, cfg, stats):
+        candidate_before = stat_record(candidate.path)
+        if candidate_before is None or not records_still_match(candidate, candidate_before):
+            continue
+        try:
+            candidate_digest = hash_file(candidate.path, buffer_size)
+        except OSError as exc:
+            logging.debug("Source hash failed: %s | %s", candidate.path, exc)
+            continue
+        if stats is not None:
+            stats.source_candidates_hashed += 1
+        candidate_after = stat_record(candidate.path)
+        if candidate_after is None or not records_still_match(candidate_before, candidate_after):
+            logging.debug("Source changed during hash, skipped: %s", candidate.path)
+            continue
+        if candidate_digest != target_digest:
+            continue
+        try:
+            if not files_have_same_content(target.path, candidate.path, buffer_size):
+                continue
+        except OSError as exc:
+            logging.debug("Source byte compare failed: %s <-> %s | %s", target.path, candidate.path, exc)
+            continue
+        target_latest = stat_record(target.path)
+        candidate_latest = stat_record(candidate.path)
+        if target_latest is None or candidate_latest is None:
+            continue
+        if not records_still_match(target_after, target_latest):
+            logging.debug("Target changed before source match finalized: %s", target.path)
+            return None
+        if not records_still_match(candidate_after, candidate_latest):
+            logging.debug("Source changed before source match finalized: %s", candidate.path)
+            continue
+        return candidate.path, candidate_latest
+    return None
+
+
+def link_to_matching_source(
+    target: FileRecord,
+    source_roots: Sequence[Path],
+    cfg: Dict,
+    stats: Stats,
+    dry_run: bool,
+) -> bool:
+    buffer_size = max(1, int(cfg.get("hash_buffer_mb", 8))) * 1024 * 1024
+    matched = find_matching_source_file(target, source_roots, cfg, buffer_size, stats)
+    if matched is None:
+        return False
+    source_path, source_record = matched
+    ok, _ = hardlink_duplicate(
+        target,
+        source_path,
+        cfg,
+        dry_run=dry_run,
+        canonical_record=source_record,
+    )
+    if ok:
+        stats.source_hardlinked_files += 1
+        stats.hardlinked_files += 1
+        stats.saved_bytes += target.size
+    return ok
+
+
+def handle_watch_path(
+    path: Path,
+    source_roots: Sequence[Path],
+    cfg: Dict,
+    stats: Stats,
+    dry_run: bool,
+) -> bool:
+    if is_dedupe_backup_path(path) or path.is_symlink():
+        return False
+
+    stable = wait_for_stable_file(
+        path,
+        stable_seconds=float(cfg.get("watch_stable_seconds", 8)),
+        poll_seconds=float(cfg.get("watch_poll_seconds", 1)),
+        timeout_seconds=float(cfg.get("watch_timeout_seconds", 120)),
+    )
+    if stable is None:
+        logging.debug("Watch target did not stabilize before timeout: %s", path)
+        return False
+    if stable.size < int(cfg.get("min_size_bytes", 0)):
+        return False
+    logging.info("Watch processing stable file: %s", path)
+    linked = link_to_matching_source(stable, source_roots, cfg, stats, dry_run=dry_run)
+    if not linked:
+        logging.debug("Watch found no matching source for: %s", path)
+    return linked
+
+
+def run_watch(roots: Sequence[Path], source_roots: Sequence[Path], cfg: Dict, dry_run: bool) -> int:
+    try:
+        from watchdog.events import FileSystemEventHandler  # type: ignore
+        from watchdog.observers import Observer  # type: ignore
+    except ImportError as exc:
+        raise SystemExit(
+            "Missing dependency: watchdog\n"
+            "Install it with:\n"
+            "  python -m pip install -r requirements.txt\n"
+        ) from exc
+
+    existing_roots = [root for root in roots if root.exists()]
+    existing_source_roots = [root for root in source_roots if root.exists()]
+    if not existing_roots:
+        logging.error("No existing WeChat roots to watch.")
+        return 1
+    if not existing_source_roots:
+        logging.error("No existing source_roots to match against.")
+        return 1
+
+    stats = Stats()
+    work_queue: "queue.Queue[Path]" = queue.Queue()
+    stop_event = threading.Event()
+
+    def enqueue(path_str: str) -> None:
+        path = Path(path_str)
+        if is_dedupe_backup_path(path):
+            return
+        work_queue.put(path)
+
+    class WeChatFileEventHandler(FileSystemEventHandler):  # type: ignore[misc]
+        def on_created(self, event) -> None:  # type: ignore[no-untyped-def]
+            if not event.is_directory:
+                enqueue(event.src_path)
+
+        def on_modified(self, event) -> None:  # type: ignore[no-untyped-def]
+            if not event.is_directory:
+                enqueue(event.src_path)
+
+        def on_moved(self, event) -> None:  # type: ignore[no-untyped-def]
+            if not event.is_directory:
+                enqueue(event.dest_path)
+
+    def worker() -> None:
+        last_attempts: Dict[Path, float] = {}
+        while not stop_event.is_set():
+            try:
+                path = work_queue.get(timeout=1)
+            except queue.Empty:
+                continue
+            now = time.time()
+            last_attempt = last_attempts.get(path)
+            if last_attempt is not None and now - last_attempt < float(cfg.get("watch_poll_seconds", 1)):
+                work_queue.task_done()
+                continue
+            last_attempts[path] = now
+            try:
+                if handle_watch_path(path, existing_source_roots, cfg, stats, dry_run):
+                    logging.info(
+                        "Watch linked=%d | source_candidates=%d | source_hashed=%d | saved=%.2f MB",
+                        stats.source_hardlinked_files,
+                        stats.source_candidates_scanned,
+                        stats.source_candidates_hashed,
+                        stats.saved_bytes / 1024 / 1024,
+                    )
+            except Exception:
+                logging.exception("Watch worker failed while processing: %s", path)
+            finally:
+                work_queue.task_done()
+
+    observer = Observer()
+    handler = WeChatFileEventHandler()
+    for root in existing_roots:
+        observer.schedule(handler, str(root), recursive=True)
+        logging.info("Watching WeChat root: %s", root)
+    logging.info("Source roots: %s", ", ".join(str(root) for root in existing_source_roots))
+
+    worker_thread = threading.Thread(target=worker, name="wechat-dedupe-watch-worker", daemon=True)
+    worker_thread.start()
+    observer.start()
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        logging.info("Watch mode interrupted.")
+    finally:
+        stop_event.set()
+        observer.stop()
+        observer.join()
+    return 0
+
+
+def recover_interrupted_backups(roots: Sequence[Path], buffer_size: int) -> BackupRecoveryStats:
+    stats = BackupRecoveryStats()
+    for root in roots:
+        if not root.exists():
+            continue
+        for dirpath, _, filenames in os.walk(root, followlinks=False):
+            for filename in filenames:
+                backup = Path(dirpath) / filename
+                original = original_path_for_backup(backup)
+                if original is None:
+                    continue
+                try:
+                    if backup.is_symlink() or not backup.is_file():
+                        continue
+                    if not original.exists():
+                        backup.rename(original)
+                        stats.restored_backups += 1
+                        logging.info("Recovered interrupted backup: %s -> %s", backup, original)
+                        continue
+                    if is_same_physical_file(backup, original):
+                        backup.unlink()
+                        stats.removed_backups += 1
+                        logging.info("Removed redundant backup hardlink: %s", backup)
+                        continue
+
+                    backup_rec = stat_record(backup)
+                    original_rec = stat_record(original)
+                    if backup_rec is None or original_rec is None:
+                        stats.errors += 1
+                        logging.warning("Backup recovery stat failed, left in place: %s", backup)
+                        continue
+                    if backup_rec.size == original_rec.size and files_have_same_content(
+                        backup,
+                        original,
+                        buffer_size,
+                    ):
+                        backup.unlink()
+                        stats.removed_backups += 1
+                        logging.info("Removed redundant backup with identical content: %s", backup)
+                        continue
+
+                    stats.conflicted_backups += 1
+                    logging.warning(
+                        "Backup recovery conflict, left in place: backup=%s original=%s",
+                        backup,
+                        original,
+                    )
+                except OSError as exc:
+                    stats.errors += 1
+                    logging.warning("Backup recovery failed, left in place: %s | %s", backup, exc)
+    return stats
 
 
 def stat_record(path: Path) -> Optional[FileRecord]:
@@ -506,9 +899,7 @@ def hardlink_duplicate(
         logging.info("[DRY-RUN] duplicate -> hardlink: %s -> %s", duplicate.path, canonical)
         return True, duplicate
 
-    tmp_backup = duplicate.path.with_name(
-        f".{duplicate.path.name}.dedupe_backup.{os.getpid()}.{int(time.time() * 1000)}"
-    )
+    tmp_backup = make_backup_path(duplicate.path)
 
     try:
         duplicate.path.rename(tmp_backup)
@@ -613,6 +1004,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--dry-run", action="store_true", help="Only report planned actions; do not hardlink.")
     parser.add_argument("--init-config", action="store_true", help="Write default config.json if missing, then exit.")
     parser.add_argument("--kill-wechat", action="store_true", help="Kill WeChat processes before scanning.")
+    parser.add_argument("--watch", action="store_true", help="Watch WeChat roots and link new copies to source_roots.")
     args = parser.parse_args(argv)
 
     script_dir = Path(__file__).resolve().parent
@@ -626,7 +1018,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 0
 
     cfg = load_config(config_path)
-    roots = [Path(p).expanduser() for p in cfg.get("roots", [])]
+    roots = resolve_config_paths(cfg.get("roots", []))
+    source_roots = resolve_config_paths(cfg.get("source_roots", []))
 
     db_path = Path(cfg.get("db_path", DEFAULT_CONFIG["db_path"]))
     if not db_path.is_absolute():
@@ -637,11 +1030,33 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         log_dir = script_dir / log_dir
     setup_logging(log_dir)
 
+    dry_run = bool(args.dry_run or cfg.get("dry_run", False))
+
     if args.kill_wechat or cfg.get("kill_wechat_before_run", False):
         kill_wechat_processes()
         time.sleep(2)
 
-    dry_run = bool(args.dry_run or cfg.get("dry_run", False))
+    recovery_buffer_size = max(1, int(cfg.get("hash_buffer_mb", 8))) * 1024 * 1024
+    if dry_run:
+        logging.info("Backup recovery skipped in dry-run mode.")
+    elif args.watch:
+        logging.info("Backup recovery skipped in watch mode; weekly task handles full recovery.")
+    else:
+        recovery = recover_interrupted_backups(roots, recovery_buffer_size)
+        if (
+            recovery.restored_backups
+            or recovery.removed_backups
+            or recovery.conflicted_backups
+            or recovery.errors
+        ):
+            logging.info(
+                "Backup recovery: restored=%d | removed=%d | conflicts=%d | errors=%d",
+                recovery.restored_backups,
+                recovery.removed_backups,
+                recovery.conflicted_backups,
+                recovery.errors,
+            )
+
     db_missing_before_run = not db_path.exists()
     scheduled_full = should_do_scheduled_full_scan(cfg)
     full_scan = bool(args.full or db_missing_before_run or scheduled_full)
@@ -650,8 +1065,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     logging.info("Config: %s", config_path)
     logging.info("DB: %s", db_path)
     logging.info("Roots: %s", ", ".join(str(r) for r in roots))
+    if source_roots:
+        logging.info("Source roots: %s", ", ".join(str(r) for r in source_roots))
     logging.info("Mode: %s", "FULL" if full_scan else f"RECENT-{cfg['recent_months']}-MONTHS")
     logging.info("Dry run: %s", dry_run)
+
+    if args.watch:
+        logging.info("Watch mode: ON")
+        return run_watch(roots, source_roots, cfg, dry_run=dry_run)
 
     stats = Stats()
     db = DedupeDB(db_path)

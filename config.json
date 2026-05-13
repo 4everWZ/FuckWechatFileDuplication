@@ -2,6 +2,11 @@
   "roots": [
     "D:\\xwechat_files"
   ],
+  "source_roots": [
+    "~\\Downloads",
+    "~\\Desktop",
+    "D:\\Paper"
+  ],
   "db_path": "wechat_dedupe_index.sqlite3",
   "log_dir": "logs",
   "min_size_bytes": 65536,
@@ -18,5 +23,8 @@
   "byte_compare_before_link": true,
   "same_volume_only": true,
   "hash_buffer_mb": 8,
+  "watch_stable_seconds": 8,
+  "watch_poll_seconds": 1,
+  "watch_timeout_seconds": 120,
   "prune_missing_on_full_scan": true
 }

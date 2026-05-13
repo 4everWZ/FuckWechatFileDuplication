@@ -12,7 +12,7 @@ $Action = New-ScheduledTaskAction `
     -Execute $Bat `
     -WorkingDirectory $ScriptDir
 
-$Trigger = New-ScheduledTaskTrigger -Daily -At 3:30AM
+$Trigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Sunday -At 3:30AM
 
 $Settings = New-ScheduledTaskSettingsSet `
     -StartWhenAvailable `
@@ -33,5 +33,5 @@ Register-ScheduledTask `
     -Force
 
 Write-Host "Installed scheduled task: $TaskName"
-Write-Host "Daily run time: 03:30"
+Write-Host "Weekly run time: Sunday 03:30"
 Write-Host "Script: $Bat"
